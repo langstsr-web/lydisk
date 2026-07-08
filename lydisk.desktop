@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LYDisk
+GenericName=Яндекс Диск
+Comment=Графическая оболочка для консольного клиента Яндекс Диска
+Exec=python3 "/home/stanislav/Проекты/LYDisk/lydisk.py"
+Icon=/home/stanislav/Проекты/LYDisk/icons/lydisk.svg
+Terminal=false
+Categories=Network;FileTransfer;Qt;
+Keywords=yandex;disk;диск;яндекс;синхронизация;
