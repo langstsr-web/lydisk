@@ -7,7 +7,7 @@
 #   sudo apt update && sudo apt install yandex-disk
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$DIR/build/lydisk_${VERSION}_all"
 

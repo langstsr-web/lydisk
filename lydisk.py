@@ -245,6 +245,73 @@ def restart_daemon() -> tuple[int, str]:
     return run_cli(*daemon_start_args())
 
 
+# ------------------------------------------ отказ сервера в дельта-загрузке
+#
+# Изменённый файл клиент грузит дельтой от прошлой версии, если знает её
+# с момента своего запуска, иначе — целиком. С октября 2026 сервер Яндекса
+# отвечает 500 на любую дельту, и клиент повторяет её бесконечно. После
+# перезапуска демона прошлые версии забыты — файлы уходят целиком.
+
+DELTA_HEAL_COOLDOWN = 15 * 60  # перезапускать не чаще раза в 15 минут
+
+# Хвосты перечислены явно: так путь с кавычками внутри разбирается целиком.
+_PUT_RE = re.compile(
+    r'^\S+ PUT "(.+?)"(?: (delta|delta gzip|gzip|500|OK|201 Hardlink OK))?$')
+_DAEMON_START_RE = re.compile(r"^\S+ STATE version \d+ read\b")
+
+
+class DeltaLogWatcher:
+    """Дочитывает журнал ядра по мере роста и помнит застрявшие файлы:
+    последняя попытка загрузки — дельта, отклонённая сервером (500).
+
+    Клиент со временем перестаёт повторять такой файл, поэтому журнал читается
+    целиком и состояние переживает его ротацию; сбрасывается оно при старте
+    демона — тот сам заново пробует все сбойные файлы.
+    """
+
+    def __init__(self):
+        self.stuck: set[str] = set()
+        self._mode: dict[str, str] = {}
+        self._inode = None
+        self._offset = 0
+        self._partial = b""
+
+    def poll(self, disk_dir: str):
+        """Прочитать новые строки <папка Диска>/.sync/core.log."""
+        try:
+            with open(Path(disk_dir) / ".sync" / "core.log", "rb") as f:
+                st = os.fstat(f.fileno())
+                if st.st_ino != self._inode or st.st_size < self._offset:
+                    self._inode, self._offset, self._partial = st.st_ino, 0, b""
+                f.seek(self._offset)
+                data = f.read()
+        except OSError:
+            return
+        self._offset += len(data)
+        *lines, self._partial = (self._partial + data).split(b"\n")
+        self.feed(line.decode("utf-8", errors="replace") for line in lines)
+
+    def feed(self, lines):
+        for line in lines:
+            if _DAEMON_START_RE.match(line):
+                self._mode.clear()
+                self.stuck.clear()
+                continue
+            m = _PUT_RE.match(line)
+            if not m:
+                continue
+            path, tail = m.groups()
+            if tail in ("delta", "delta gzip"):
+                self._mode[path] = "delta"
+            elif tail in (None, "gzip"):
+                self._mode[path] = "full"
+            elif tail == "500" and self._mode.pop(path, None) == "delta":
+                self.stuck.add(path)
+            else:  # 500 на полной загрузке, OK, 201 Hardlink OK
+                self._mode.pop(path, None)
+                self.stuck.discard(path)
+
+
 # ---------------------------------------------------- systemd-автозапуск демона
 
 def systemd_unit_text() -> str:
@@ -288,6 +355,16 @@ def set_systemd_autostart(enabled: bool) -> bool:
     SYSTEMD_UNIT_PATH.unlink(missing_ok=True)
     _systemctl("daemon-reload")
     return True
+
+
+def restart_sync_service() -> tuple[int, str]:
+    """Перезапустить демон: через systemd-юнит, если демон работает под ним,
+    иначе напрямую (юнит бывает включён, а демон запущен в обход него)."""
+    if _systemctl("is-active", "--quiet", "yandex-disk.service"):
+        if _systemctl("restart", "yandex-disk.service"):
+            return 0, "Демон перезапущен"
+        return 1, "Не удалось перезапустить yandex-disk.service"
+    return restart_daemon()
 
 
 def refresh_systemd_unit():
@@ -1551,6 +1628,15 @@ class SettingsDialog(QDialog):
         self.notify_cb.setChecked(settings.value("notify", True, type=bool))
         form.addRow(self.notify_cb)
 
+        self.delta_heal_cb = QCheckBox(
+            "Перезапускать демон, если Яндекс отклоняет загрузку изменений")
+        self.delta_heal_cb.setToolTip(
+            "Сервер отвечает ошибкой на загрузку только изменённой части файла. "
+            "После перезапуска демон загружает такие файлы целиком "
+            f"(не чаще раза в {DELTA_HEAL_COOLDOWN // 60} минут).")
+        self.delta_heal_cb.setChecked(settings.value("delta_heal", True, type=bool))
+        form.addRow(self.delta_heal_cb)
+
         self.systemd_cb = QCheckBox(
             "Синхронизировать в фоне при входе в систему (systemd, без LYDisk)")
         self.systemd_cb.setChecked(systemd_autostart_enabled())
@@ -1631,6 +1717,7 @@ class SettingsDialog(QDialog):
         self.settings.setValue("start_daemon", self.daemon_cb.isChecked())
         self.settings.setValue("minimize_to_tray", self.tray_cb.isChecked())
         self.settings.setValue("notify", self.notify_cb.isChecked())
+        self.settings.setValue("delta_heal", self.delta_heal_cb.isChecked())
         self.settings.setValue("read_only", self.readonly_cb.isChecked())
         self.settings.setValue("overwrite", self.overwrite_cb.isChecked())
         set_autostart(self.autostart_cb.isChecked())
@@ -1691,6 +1778,9 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._last_state = None
         self._quota_warned = False
+        self._delta_log = DeltaLogWatcher()
+        self._delta_heal_after = None  # пауза отсчитывается от первого опроса
+        self._delta_heal_notified = False
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -2032,6 +2122,34 @@ class MainWindow(QMainWindow):
             self.tray.showMessage(
                 notif[0], notif[1],
                 QSystemTrayIcon.MessageIcon.Information, 5000)
+        self._maybe_heal_delta(st["state"])
+
+    def _maybe_heal_delta(self, state: str):
+        """Перезапустить демон, если сервер отклоняет дельта-загрузку."""
+        if not self.settings.value("delta_heal", True, type=bool):
+            return
+        self._delta_log.poll(self.disk_dir())
+        now = time.monotonic()
+        if self._delta_heal_after is None:
+            self._delta_heal_after = now + DELTA_HEAL_COOLDOWN
+        # В простое тоже: клиент со временем бросает повторы и считает,
+        # что всё синхронизировано.
+        if (state not in ("error", "idle") or now < self._delta_heal_after
+                or not self._delta_log.stuck):
+            return
+        self._delta_heal_after = now + DELTA_HEAL_COOLDOWN
+        self.statusBar().showMessage(
+            "Яндекс отклонил загрузку изменений "
+            f"(файлов: {len(self._delta_log.stuck)}) — перезапуск демона…")
+        if (not self._delta_heal_notified and self.tray
+                and self.settings.value("notify", True, type=bool)):
+            self._delta_heal_notified = True
+            self.tray.showMessage(
+                "Перезапуск синхронизации",
+                "Яндекс отклоняет загрузку изменённых файлов. LYDisk перезапускает "
+                "демон, чтобы загрузить их целиком; дальше — без уведомлений.",
+                QSystemTrayIcon.MessageIcon.Information, 8000)
+        run_async(restart_sync_service, self._on_command_done)
 
     def _set_tray(self, color: str, label: str):
         if self.tray:
